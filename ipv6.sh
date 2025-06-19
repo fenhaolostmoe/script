@@ -91,6 +91,44 @@ confirm() {
     done
 }
 
+# 获取当前IPv6网关
+get_ipv6_gateway() {
+    local nic=$1
+    ip -6 route show default via dev "$nic" 2>/dev/null | awk '/default/ {print $3}'
+}
+
+# 设置IPv6网关为fe80::1
+set_ipv6_gateway() {
+    local nic=$1
+    local current_gateway=$(get_ipv6_gateway "$nic")
+    local new_gateway="fe80::1"
+    
+    if [ -n "$current_gateway" ]; then
+        if [ "$current_gateway" != "$new_gateway" ]; then
+            echo "检测到错误网关: $current_gateway，正在修改为 $new_gateway"
+            # 删除当前网关
+            ip -6 route del default via "$current_gateway" dev "$nic" || true
+        else
+            echo "网关已正确配置为 $new_gateway"
+            return 0
+        fi
+    else
+        echo "未检测到IPv6网关，正在设置为 $new_gateway"
+    fi
+    
+    # 添加新网关
+    ip -6 route add default via "$new_gateway" dev "$nic"
+    
+    if [ $? -eq 0 ]; then
+        echo "IPv6网关已成功设置为 $new_gateway"
+        return 0
+    else
+        echo "设置IPv6网关失败"
+        return 1
+    fi
+}
+
+# 配置IPv6自动获取
 configure_ipv6() {
     local nic=$1
     case "$OS_FAMILY" in
@@ -169,10 +207,60 @@ EOF
             sysctl --system
             ;;
     esac
+    
+    # 设置IPv6网关
+    set_ipv6_gateway "$nic"
+}
+
+# 验证IPv6连接
+verify_ipv6_connection() {
+    local nic=$1
+    echo -e "\n正在验证IPv6连接（最多等待15秒）..."
+    
+    # 检查是否有全局IPv6地址
+    local timeout=15
+    local start_time=$(date +%s)
+    local global_ipv6=""
+    
+    while true; do
+        global_ipv6=$(ip -6 addr show "$nic" scope global | grep 'inet6' | awk '{print $2}' | cut -d/ -f1 | head -n1)
+        if [ -n "$global_ipv6" ]; then
+            echo "已获取全局IPv6地址: $global_ipv6"
+            break
+        fi
+        
+        local current_time=$(date +%s)
+        if [ $((current_time - start_time)) -ge $timeout ]; then
+            echo "超时未获取到全局IPv6地址"
+            break
+        fi
+        
+        sleep 1
+    done
+    
+    # 检查网关是否正确配置
+    local gateway=$(get_ipv6_gateway "$nic")
+    if [ "$gateway" == "fe80::1" ]; then
+        echo "IPv6网关配置正确: $gateway"
+    else
+        echo "警告: IPv6网关配置可能不正确: $gateway"
+    fi
+    
+    # 尝试ping6测试连接
+    echo "尝试ping6测试连接..."
+    if ping6 -c3 -I "$nic" 2001:4860:4860::8888 &>/dev/null; then
+        echo "IPv6连接测试成功！"
+        echo "  验证命令：ping6 -c3 2001:4860:4860::8888（Google公共DNS）"
+    else
+        echo "IPv6连接测试失败，可能原因："
+        echo "  1. 网络环境不支持IPv6（联系服务商确认）"
+        echo "  2. 路由器通告延迟或配置错误"
+        echo "  3. 防火墙阻止了IPv6流量"
+    fi
 }
 
 main() {
-    echo "IPv6智能配置脚本（完美修复版）"
+    echo "IPv6智能配置脚本（带网关修复功能）"
     echo "----------------------------------------"
 
     detect_system
@@ -195,33 +283,17 @@ main() {
         "generic") action="调整IPv6内核参数并持久化" ;;
     esac
     echo "  - $action"
+    echo "  - 检测并修复IPv6网关配置（设置为fe80::1）"
     if ! confirm "确认开始配置？"; then
         echo "用户取消配置，脚本退出"
         exit 1
     fi
 
     configure_ipv6 "$main_nic"
-    echo -e "\nIPv6配置完成！正在验证（最多等待10秒）..."
-
-    local timeout=10
-    local start_time=$(date +%s)
-    while true; do
-        if ip -6 addr show "$main_nic" | grep -q 'inet6 '; then
-            echo "成功获取IPv6地址！"
-            echo "  验证命令：ping6 -c3 2001:4860:4860::8888（Google公共DNS）"
-            break
-        fi
-
-        local current_time=$(date +%s)
-        if [ $((current_time - start_time)) -ge $timeout ]; then
-            echo "超时未检测到IPv6地址，可能原因："
-            echo "  1. 网络环境不支持IPv6（联系服务商确认）"
-            echo "  2. 路由器通告延迟（尝试：ip -6 route show）"
-            break
-        fi
-
-        sleep 1
-    fi
+    verify_ipv6_connection "$main_nic"
+    
+    echo -e "\nIPv6配置完成！"
+    echo "注意：如果网关设置未生效，可能需要重启网络服务或系统。"
 }
 
 main "${1:-}"
